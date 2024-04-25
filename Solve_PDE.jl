@@ -1,25 +1,44 @@
-using DynamicalSystems, OrdinaryDiffEq, CairoMakie,Random, LinearAlgebra
+using DrWatson
+@quickactivate
+using Pkg; Pkg.add("GLMakie")
+using OrdinaryDiffEq, GLMakie, Random,LinearAlgebra,DynamicalSystems
 
-function Fitzhugh_Nagumo_reaction(x,p,t)
-    a, b, epsilon  = p
-    u,w = x
-    du =@. a * u * (u - b) * (1 - u) - w  
-    dw =@. epsilon * (u - w)
-    return SVector(du,dw)*0
+# function Fitzhugh_Nagumo_reaction(x,p,t)
+#     a, b, epsilon  = p
+#     u,w = x
+#     du =@. a * u * (u - b) * (1 - u) - w  
+#     dw =@. epsilon * (u - w)
+#     return SVector(du,dw)*0
+# end
+
+function Fitzhugh_Nagumo_reaction(u,p,t)
+    a, b, epsilon = p
+    uu = @view u[1,:,:]
+    vv = @view u[2,:,:]
+
+    # This code can be optimized a lot if time allows
+    # Create padded u matrix to incorporate Newman boundary conditions - 9-point stencil
+
+    # uuu=[ [uu[2,2] uu[2,:]' uu[2,end-1] ] ; [ uu[:,2] uu uu[:,end-1] ] ; [ uu[end-1,2] uu[end-1,:]' uu[end-1,end-1] ] ]
+    # diff_term = d .* ( 
+    #     4 .* (uuu[2:end-1,1:end-2] .+ uuu[2:end-1,3:end] .+ 
+    #         uuu[3:end,2:end-1] .+ uuu[1:end-2,2:end-1] ) .+ 
+    #         uuu[3:end,3:end] .+ uuu[3:end,1:end-2] .+ uuu[1:end-2,3:end] .+ 
+    #         uuu[1:end-2,1:end-2] .- 20 .*uu  
+    # ) ./ hsq6  
+
+    diff_term = laplace_9ps(uu)
+    diff_term = ghost_layer(diff_term)
+
+    du = zeros(2,N,N)
+    du[1,:,:] = a .* uu .*(1 .-uu).*(uu.-b) .- vv .+ diff_term
+    du[2,:,:] = epsilon .* (uu .- vv )
+    return du
 end
 
 function Euler_step(u,w,fun,p)
     return @.[u,w] + delta_t * fun([u,w],p,0)
 end
-
-function ODE_step(x,fun,p)
-    diffeq = (alg = Tsit5(), adaptive = false, delta_t=0.003)
-    ds = @. ContinuousDynamicalSystem(fun,x,p ;diffeq)
-    step!(ds,1)
-    x = current_state(ds)
-    t = current_time(ds)
-    return x,t 
-end 
 
 function ghost_layer(x_grid)
     extended_matrix = zeros(size(x_grid))
@@ -67,8 +86,8 @@ function initialize_u(n)
     matrix = zeros(Float64, n, n)
 
     # Setze die untere Hälfte der Matrix auf Einsen
-    matrix[:,Integer(n/4):end] .= 1
-    return Float64.(matrix)
+    matrix[:,Integer(round(n/4)):end] .= 1
+    return matrix
 end
 
 function initialize_w(n)
@@ -79,10 +98,10 @@ function initialize_w(n)
     lower_left_size = div(n, 2)
 
     # Setze das untere linke Viertel auf 0.5
-    #matrix[end-lower_left_size+1:end, 1:lower_left_size] .= .2
-    matrix.=.2
+    matrix[end-lower_left_size+1:end, 1:lower_left_size] .= .2
+    
     # Zeige die erstellte Matrix
-    return Float64.(matrix)
+    return matrix
 end
 
 function laplace_9ps(x_y_grid)
@@ -96,7 +115,7 @@ function laplace_9ps(x_y_grid)
             laplace = laplace + alpha * circshift(matrix,(i,j))         
         end
     end
-    return laplace/(6*h^2)
+    return laplace/hsq6
 end
 
 function step_PDE(u,w,fun)
@@ -129,18 +148,49 @@ function PDE_trajectory(u,w,iterations,fun)
 end
 
 delta_t = .003
-d = 1
-par = [3,.2,.01]
-N = 150
+d = 1.
+par = 3.,.2,.01
+N = 150 
 h = 2
+hsq6 = 6*h^2
 
 
-u_0,w_0 = initialize_gaussian(N), initialize_w(N)
-u_list,w_list = PDE_trajectory(u_0,w_0,100000,Fitzhugh_Nagumo_reaction)
-length(u_list)
-heatmap(u_list[end])
+allsols = []
+allts = []
 
+u0 = zeros(2,N,N)
+# u0[1,40:41,40:41] .= 0.999
+# u0[1,75:76,75:76] .= 0.999
 
+u0[1,:,:] = initialize_u(N) 
+u0[2,:,:] = initialize_w(N)
 
-heatmap(u_0 + delta_t * laplace_9ps(u_0))
+saveat = 0.0:2:1500
+tspan = (saveat[1], saveat[end])
 
+prob = ODEProblem(Fitzhugh_Nagumo_reaction, u0, tspan, par)
+sol = solve(prob, Tsit5(); reltol=1e-6, abstol=1e-6, maxiters = 1e7, saveat)
+tvec = sol.t
+uout = [u[1, :, :] for u in sol.u]
+push!(allsols, uout)
+push!(allts, tvec)
+
+name = "asdf"
+
+heatobs = GLMakie.Observable(uout[1])
+tobs = GLMakie.Observable(0.0)
+titobs = GLMakie.lift(t -> "t = $(t)", tobs)
+
+fig = GLMakie.Figure(resolution = (600*2, 550*2))
+ax = fig[1,1] = GLMakie.Axis(fig; title = titobs)
+hmap = GLMakie.heatmap!(ax, heatobs; colormap = :tokyo, colorrange = (-0.2, 1))
+cb = GLMakie.Colorbar(fig[1, 2], hmap; width = 20)
+display(fig)
+
+GLMakie.record(
+    fig,"fitzhugh_$(name).mp4", 
+    1:length(tvec); framerate = 30) do i
+    
+tobs[] = tvec[i]
+heatobs[] = uout[i]
+end
